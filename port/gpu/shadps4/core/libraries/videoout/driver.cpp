@@ -359,14 +359,22 @@ void VideoOutDriver::Flip(const Request& req) {
                         (wait_now[4] - last_wait[4]) / 1e6, (wait_now[6] - last_wait[6]) / 1e6);
         }
         std::copy(std::begin(wait_now), std::end(wait_now), std::begin(last_wait));
+        static u64 last_dl, last_dl_bytes, last_dl_finish;
+        const u64 dl = TlgStats::buffer_downloads.load(), dl_bytes = TlgStats::buffer_download_bytes.load(),
+                  dl_finish = TlgStats::t_download_finish.load();
         if (stall) {
-            std::printf("       fault handlers: %llu read faults %.1f ms, write faults %.1f ms\n",
+            std::printf("       fault handlers: %llu read faults %.1f ms, write faults %.1f ms; "
+                        "%llu buffer downloads (%.1f KB), GPU drain %.1f ms\n",
                         static_cast<unsigned long long>(rf - last_rf), (trf - last_trf) / 1e6,
-                        (twf - last_twf) / 1e6);
+                        (twf - last_twf) / 1e6, static_cast<unsigned long long>(dl - last_dl),
+                        (dl_bytes - last_dl_bytes) / 1e3, (dl_finish - last_dl_finish) / 1e6);
         }
         last_rf = rf;
         last_trf = trf;
         last_twf = twf;
+        last_dl = dl;
+        last_dl_bytes = dl_bytes;
+        last_dl_finish = dl_finish;
         const u64 copy_ns = TlgStats::t_copy.load(), copy_bytes = TlgStats::copy_bytes.load();
         u64 proc_flt = 0;
 #ifndef _WIN32
@@ -517,6 +525,18 @@ void VideoOutDriver::Flip(const Request& req) {
                         TlgStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(TlgStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(TlgStats::scene_draws.exchange(0)) / frames : 0.0);
+            // tlg: guest accesses to GPU-modified buffers each drain the whole GPU queue.
+            static u64 window_dl, window_dl_bytes, window_dl_finish;
+            if (frames) {
+                std::printf("Buffer downloads: %.1f/frame, %.1f KB/frame, GPU drain %.1f ms/frame "
+                            "(%.1f%% of the window)\n",
+                            double(dl - window_dl) / frames, (dl_bytes - window_dl_bytes) / 1e3 / frames,
+                            (dl_finish - window_dl_finish) / 1e6 / frames,
+                            (dl_finish - window_dl_finish) / (window * 1e7));
+            }
+            window_dl = dl;
+            window_dl_bytes = dl_bytes;
+            window_dl_finish = dl_finish;
             presenter->GetRasterizer().GetPipelineCache().ReportCompilerStats();
             Vulkan::WaitDiagnostics::Report();
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).

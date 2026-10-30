@@ -77,12 +77,27 @@ struct PageManager::Impl {
     virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
 
     // tlg: TLG_FAULT_PROFILE=1 prints, every 5 s, the guest instructions whose faults on GPU
-    // tracked pages cost the most time (which game code waits on the GPU, and for what).
-    struct FaultSite { u64 count = 0, ns = 0; VAddr last = 0; u64 caller = 0; bool write = false; };
-    static void ProfileFault(void* context, VAddr addr, bool write, u64 ns) {
+    // tracked pages cost the most time (which game code waits on the GPU, and for what), with
+    // the buffer downloads started while each fault was handled (other threads' included).
+    // On with TLG_FRAME_STATS=1 too, unless TLG_FAULT_PROFILE=0.
+    struct FaultSite {
+        u64 count = 0, ns = 0;
+        VAddr last = 0;
+        u64 caller = 0;
+        bool write = false;
+        u64 downloads = 0, drain_ns = 0;
+    };
+    static bool ProfileEnabled() {
+        static const bool enabled = [] {
+            const char* e = std::getenv("TLG_FAULT_PROFILE");
+            return e && *e ? *e == '1' : TlgStats::enabled;
+        }();
+        return enabled;
+    }
+    static void ProfileFault(void* context, VAddr addr, bool write, u64 ns, u64 downloads,
+                             u64 drain_ns) {
 #if defined(__linux__) || defined(_WIN64)
-        static const bool enabled = [] { const char* e = std::getenv("TLG_FAULT_PROFILE"); return e && *e == '1'; }();
-        if (!enabled) {
+        if (!ProfileEnabled()) {
             return;
         }
         static std::mutex mutex;
@@ -106,6 +121,8 @@ struct PageManager::Impl {
         site.last = addr;
         site.write = write;
         site.caller = caller;
+        site.downloads += downloads;
+        site.drain_ns += drain_ns;
         const auto now = std::chrono::steady_clock::now();
         if (now - window < std::chrono::seconds(5)) {
             return;
@@ -117,27 +134,36 @@ struct PageManager::Impl {
         for (size_t i = 0; i < top.size() && i < 8; ++i) {
             const u64 at = top[i].first;
             const u64 from = top[i].second.caller;
-            std::printf(" [%s %#llx<-%#llx x%llu %.1f ms @%#llx]", top[i].second.write ? "W" : "R",
+            std::printf(" [%s %#llx<-%#llx x%llu %.1f ms, %llu downloads %.1f ms drain @%#llx]",
+                        top[i].second.write ? "W" : "R",
                         static_cast<unsigned long long>(at >= 0x800000000ull && at < 0x810000000ull ? at - 0x800000000ull : at),
                         static_cast<unsigned long long>(from >= 0x800000000ull && from < 0x810000000ull ? from - 0x800000000ull : from),
                         static_cast<unsigned long long>(top[i].second.count), top[i].second.ns / 1e6,
+                        static_cast<unsigned long long>(top[i].second.downloads),
+                        top[i].second.drain_ns / 1e6,
                         static_cast<unsigned long long>(top[i].second.last));
         }
         std::printf("\n");
         std::fflush(stdout);
         sites.clear();
 #else
-        (void)context; (void)addr; (void)write; (void)ns;
+        (void)context; (void)addr; (void)write; (void)ns; (void)downloads; (void)drain_ns;
 #endif
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto start = std::chrono::steady_clock::now();
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        const u64 downloads_before = TlgStats::buffer_downloads.load(std::memory_order_relaxed);
+        const u64 drain_before = TlgStats::t_download_finish.load(std::memory_order_relaxed);
         const bool handled = HandleGuestFault(context, addr);
-        ProfileFault(context, addr, Common::IsWriteError(context),
-                     static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                         std::chrono::steady_clock::now() - start).count()));
+        if (ProfileEnabled()) {
+            ProfileFault(context, addr, Common::IsWriteError(context),
+                         static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - start).count()),
+                         TlgStats::buffer_downloads.load(std::memory_order_relaxed) - downloads_before,
+                         TlgStats::t_download_finish.load(std::memory_order_relaxed) - drain_before);
+        }
         return handled;
     }
 

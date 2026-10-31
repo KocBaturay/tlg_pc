@@ -167,7 +167,19 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 
         // GPU-modified ranges come as many small scattered islands,
         // so the download is widened to a window around the request
-        constexpr u64 WindowSize = 512_KB;
+        // tlg: every download drains the whole GPU queue. On integrated GPUs (ROG Ally) the game
+        // writes scattered over ~40 MiB that is about a third GPU-written: with 512 KiB windows
+        // that cost ~7 drains a frame (~17 ms); one wide window takes the frame's islands at once.
+        // TLG_DOWNLOAD_WINDOW_KB overrides (64..65536, a power of two).
+        static const u64 WindowSize = [this] {
+            const char* env = std::getenv("TLG_DOWNLOAD_WINDOW_KB");
+            const u64 kib = env && env[0] ? std::strtoull(env, nullptr, 10)
+                                          : (instance.IsIntegrated() ? 16384 : 512);
+            const u64 bytes = std::bit_ceil(std::clamp<u64>(kib, 64, 65536)) * 1024;
+            std::printf("GPU: buffer download window %llu KiB\n",
+                        static_cast<unsigned long long>(bytes / 1024));
+            return bytes;
+        }();
         const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
         const VAddr window_start =
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);

@@ -8,7 +8,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "tlg_settings.h"
@@ -37,6 +40,44 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {
+
+// tlg: TLG_FRAME_STATS=1 prints, every 5 s, the shaders whose writable buffer bindings mark the
+// most guest memory GPU-modified (the whole bound range counts, written or not). Guest writes
+// into those ranges each download them and drain the GPU queue (BufferCache::DownloadMemory).
+static void NoteWrittenBinding(u64 pgm_hash, VAddr address, u64 size) {
+    if (!TlgStats::enabled) {
+        return;
+    }
+    struct Site { u64 count = 0, bytes = 0, max_size = 0; VAddr last = 0; };
+    static std::mutex mutex;
+    static std::unordered_map<u64, Site> sites;
+    static auto window = std::chrono::steady_clock::now();
+    std::scoped_lock lock{mutex};
+    auto& site = sites[pgm_hash];
+    ++site.count;
+    site.bytes += size;
+    site.max_size = std::max(site.max_size, size);
+    site.last = address;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds(5)) {
+        return;
+    }
+    window = now;
+    std::vector<std::pair<u64, Site>> top(sites.begin(), sites.end());
+    std::sort(top.begin(), top.end(),
+              [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+    std::printf("Written buffers (5 s):");
+    for (size_t i = 0; i < top.size() && i < 8; ++i) {
+        const Site& s = top[i].second;
+        std::printf(" [%016llx x%llu %.1f MB, max %.1f KB @%#llx]",
+                    static_cast<unsigned long long>(top[i].first),
+                    static_cast<unsigned long long>(s.count), s.bytes / 1e6, s.max_size / 1e3,
+                    static_cast<unsigned long long>(s.last));
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+    sites.clear();
+}
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -2370,6 +2411,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                    NoteWrittenBinding(stage.pgm_hash, vsharp.base_address, size);
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
             }
@@ -3307,6 +3349,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         if (is_gds) {
             return {buffer_cache.GetGdsBuffer(), address};
         }
+        NoteWrittenBinding(0xd3af111ull, address, num_bytes); // DMA fill
         return buffer_cache.ObtainBuffer(address, num_bytes, true);
     }();
     runtime.FillBuffer(buffer, offset, num_bytes, value);
@@ -3334,6 +3377,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         if (dst_gds) {
             return {gds_buffer, dst};
         }
+        NoteWrittenBinding(0xd3ac0b1ull, dst, num_bytes); // DMA copy
         return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
     }();
     const vk::BufferCopy copy = {

@@ -112,6 +112,8 @@ inline std::atomic<std::uint64_t> t_resident{0}, t_protect{0}, t_image_create{0}
 /// Buffer downloads for guest reads and writes of GPU-modified memory (BufferCache::
 /// DownloadMemory): count, bytes, and the wall time of the full GPU drain each one waits for.
 inline std::atomic<std::uint64_t> buffer_downloads{0}, buffer_download_bytes{0}, t_download_finish{0};
+/// Downloaded bytes that differed from the guest memory they replaced (TLG_FRAME_STATS=1).
+inline std::atomic<std::uint64_t> buffer_download_changed_bytes{0};
 /// Diagnostics are collected only with TLG_FRAME_STATS=1.
 inline const bool enabled = [] {
     const char* env = std::getenv("TLG_FRAME_STATS");

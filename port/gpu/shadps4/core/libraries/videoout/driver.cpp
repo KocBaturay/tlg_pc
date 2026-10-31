@@ -526,14 +526,17 @@ void VideoOutDriver::Flip(const Request& req) {
                         frames ? double(TlgStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(TlgStats::scene_draws.exchange(0)) / frames : 0.0);
             // tlg: guest accesses to GPU-modified buffers each drain the whole GPU queue.
-            static u64 window_dl, window_dl_bytes, window_dl_finish;
+            static u64 window_dl, window_dl_bytes, window_dl_finish, window_dl_changed;
+            const u64 dl_changed = TlgStats::buffer_download_changed_bytes.load();
             if (frames) {
-                std::printf("Buffer downloads: %.1f/frame, %.1f KB/frame, GPU drain %.1f ms/frame "
-                            "(%.1f%% of the window)\n",
+                std::printf("Buffer downloads: %.1f/frame, %.1f KB/frame (%.1f KB changed by the GPU), "
+                            "GPU drain %.1f ms/frame (%.1f%% of the window)\n",
                             double(dl - window_dl) / frames, (dl_bytes - window_dl_bytes) / 1e3 / frames,
+                            (dl_changed - window_dl_changed) / 1e3 / frames,
                             (dl_finish - window_dl_finish) / 1e6 / frames,
                             (dl_finish - window_dl_finish) / (window * 1e7));
             }
+            window_dl_changed = dl_changed;
             window_dl = dl;
             window_dl_bytes = dl_bytes;
             window_dl_finish = dl_finish;

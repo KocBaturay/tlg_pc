@@ -3,6 +3,8 @@
 
 #include <chrono>
 #include <array>
+#include <cstdint>
+#include <vector>
 #include <map>
 #include <unordered_map>
 #include <algorithm>
@@ -25,6 +27,8 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 #include <vk_mem_alloc.h>
+
+extern "C" int runtime_memory_read_backing(uintptr_t address, void* data, uint64_t size);
 
 namespace VideoCore {
 
@@ -167,14 +171,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 
         // GPU-modified ranges come as many small scattered islands,
         // so the download is widened to a window around the request
-        // tlg: every download drains the whole GPU queue. On integrated GPUs (ROG Ally) the game
-        // writes scattered over ~40 MiB that is about a third GPU-written: with 512 KiB windows
-        // that cost ~7 drains a frame (~17 ms); one wide window takes the frame's islands at once.
-        // TLG_DOWNLOAD_WINDOW_KB overrides (64..65536, a power of two).
-        static const u64 WindowSize = [this] {
+        // tlg: TLG_DOWNLOAD_WINDOW_KB (64..65536, a power of two). A 16 MiB window on the ROG Ally
+        // only cut the drains from ~11 to ~8.5 a frame while the bytes went from 2 to 42 MB:
+        // the region is marked GPU-modified again between the game's writes.
+        static const u64 WindowSize = [] {
             const char* env = std::getenv("TLG_DOWNLOAD_WINDOW_KB");
-            const u64 kib = env && env[0] ? std::strtoull(env, nullptr, 10)
-                                          : (instance.IsIntegrated() ? 16384 : 512);
+            const u64 kib = env && env[0] ? std::strtoull(env, nullptr, 10) : 512;
             const u64 bytes = std::bit_ceil(std::clamp<u64>(kib, 64, 65536)) * 1024;
             std::printf("GPU: buffer download window %llu KiB\n",
                         static_cast<unsigned long long>(bytes / 1024));
@@ -241,8 +243,21 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     download.buffer->Invalidate(download.offset, download.size);
     for (const auto& copy : copies) {
         auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-        memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                copy.size);
+        const u8* src = download.mapped + (copy.dstOffset - download.offset);
+        if (TlgStats::enabled) {
+            // tlg: how much of the download the GPU really changed (stats only): ranges marked
+            // GPU-modified because a shader may write them, not because it did, read back equal.
+            static thread_local std::vector<u8> before;
+            before.resize(copy.size);
+            if (runtime_memory_read_backing(arena_base + copy.srcOffset, before.data(), copy.size)) {
+                u64 changed = 0;
+                for (u64 i = 0; i < copy.size; ++i) {
+                    changed += before[i] != src[i];
+                }
+                TlgStats::buffer_download_changed_bytes.fetch_add(changed, std::memory_order_relaxed);
+            }
+        }
+        memory->TryWriteBacking(dst_addr, src, copy.size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
 }

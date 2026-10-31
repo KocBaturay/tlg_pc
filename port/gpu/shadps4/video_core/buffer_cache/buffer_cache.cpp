@@ -121,7 +121,112 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
 BufferCache::~BufferCache() = default;
 
+// tlg: TLG_WRITE_MERGE=1 (experimental, ROG Ally): a CPU write into GPU-modified pages no longer
+// downloads them (each download drains the whole GPU queue). One shader binds 4-7 MiB writable
+// blocks ~650 times a frame while the GPU changes ~0.4 MiB, so the game's own writes into the same
+// region drained the queue ~10 times a frame. The pages are snapshotted instead, and their next
+// upload sends only the bytes the CPU changed. Risks: a CPU write of the exact value the page held
+// before the GPU changed it is lost, and CPU reads of GPU bytes in such a page see old data.
+static bool WriteMergeEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("TLG_WRITE_MERGE");
+        const bool on = env && env[0] == '1';
+        if (on) {
+            std::printf("GPU: write merge on (TLG_WRITE_MERGE=1, experimental)\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+/// Pages that may hold a snapshot at once (64 MiB); past it, writes download as before.
+static constexpr size_t MaxMergeSnapshots = 16384;
+
+bool BufferCache::SnapshotForMerge(VAddr page_addr, u64 size) {
+    std::scoped_lock lk{merge_mutex};
+    for (VAddr page = page_addr; page < page_addr + size; page += TRACKER_BYTES_PER_PAGE) {
+        auto& slot = merge_snapshots[page];
+        if (!slot) {
+            if (merge_snapshots.size() > MaxMergeSnapshots) {
+                merge_snapshots.erase(page);
+                return false;
+            }
+            slot = std::make_unique<PageSnapshot>();
+        }
+        if (!runtime_memory_read_backing(page, slot->data(), TRACKER_BYTES_PER_PAGE)) {
+            merge_snapshots.erase(page);
+            return false;
+        }
+        TlgStats::merge_pages.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+void BufferCache::AddMergedUploads(VAddr addr, u64 size, auto&& add_copy) {
+    std::scoped_lock lk{merge_mutex};
+    if (merge_snapshots.empty()) {
+        add_copy(addr, size);
+        return;
+    }
+    // Upload ranges are whole tracker pages (RegionManager::ForEachModifiedRange).
+    const VAddr end = addr + size;
+    VAddr plain = addr; // start of the pages not emitted yet that have no snapshot
+    PageSnapshot now;
+    for (VAddr page = addr; page < end; page += TRACKER_BYTES_PER_PAGE) {
+        const auto it = merge_snapshots.find(page);
+        if (it == merge_snapshots.end()) {
+            continue;
+        }
+        if (plain < page) {
+            add_copy(plain, page - plain);
+        }
+        plain = page + TRACKER_BYTES_PER_PAGE;
+        PageSnapshot& snapshot = *it->second;
+        if (!runtime_memory_read_backing(page, now.data(), TRACKER_BYTES_PER_PAGE)) {
+            // Unreadable: the whole page, as without the merge.
+            add_copy(page, TRACKER_BYTES_PER_PAGE);
+            merge_snapshots.erase(it);
+            continue;
+        }
+        // Exact runs only: an unchanged byte may be a stale copy of a GPU-written one.
+        for (u64 i = 0; i < TRACKER_BYTES_PER_PAGE;) {
+            if (now[i] == snapshot[i]) {
+                ++i;
+                continue;
+            }
+            u64 j = i + 1;
+            while (j < TRACKER_BYTES_PER_PAGE && now[j] != snapshot[j]) {
+                ++j;
+            }
+            add_copy(page + i, j - i);
+            TlgStats::merge_upload_bytes.fetch_add(j - i, std::memory_order_relaxed);
+            i = j;
+        }
+        snapshot = now;
+    }
+    if (plain < end) {
+        add_copy(plain, end - plain);
+    }
+}
+
+void BufferCache::DropMergeSnapshots(VAddr addr, u64 size) {
+    std::scoped_lock lk{merge_mutex};
+    if (merge_snapshots.empty()) {
+        return;
+    }
+    const VAddr first = Common::AlignDown(addr, TRACKER_BYTES_PER_PAGE);
+    for (VAddr page = first; page < addr + size; page += TRACKER_BYTES_PER_PAGE) {
+        merge_snapshots.erase(page);
+    }
+}
+
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
+    if (WriteMergeEnabled() &&
+        memory_tracker->MergeCpuWrite(device_addr, size, [this](VAddr page_addr, u64 bytes) {
+            return SnapshotForMerge(page_addr, bytes);
+        })) {
+        return;
+    }
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         ReadMemory(device_addr, size, true, assume_locks);
     });
@@ -258,6 +363,10 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             }
         }
         memory->TryWriteBacking(dst_addr, src, copy.size);
+        if (WriteMergeEnabled()) {
+            // The guest copy of these pages matches the GPU again.
+            DropMergeSnapshots(arena_base + copy.srcOffset, copy.size);
+        }
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
 }
@@ -573,8 +682,15 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 addr, u64 size) {
-            copies.emplace_back(total_size_bytes, addr, size);
-            total_size_bytes += size;
+            const auto add_copy = [&](u64 copy_addr, u64 copy_size) {
+                copies.emplace_back(total_size_bytes, copy_addr, copy_size);
+                total_size_bytes += copy_size;
+            };
+            if (WriteMergeEnabled()) {
+                AddMergedUploads(addr, size, add_copy);
+            } else {
+                add_copy(addr, size);
+            }
         },
         [&] { src_buffer = UploadCopies(arena, copies, total_size_bytes); });
 

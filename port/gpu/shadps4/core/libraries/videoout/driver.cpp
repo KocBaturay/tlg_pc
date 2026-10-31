@@ -537,6 +537,16 @@ void VideoOutDriver::Flip(const Request& req) {
                             (dl_finish - window_dl_finish) / (window * 1e7));
             }
             window_dl_changed = dl_changed;
+            static u64 window_merge_pages, window_merge_bytes;
+            const u64 merge_pages = TlgStats::merge_pages.load(), merge_bytes = TlgStats::merge_upload_bytes.load();
+            if (frames && merge_pages != window_merge_pages) {
+                std::printf("Write merge: %.1f pages/frame instead of downloads, %.1f KB/frame uploaded "
+                            "from them\n",
+                            double(merge_pages - window_merge_pages) / frames,
+                            (merge_bytes - window_merge_bytes) / 1e3 / frames);
+            }
+            window_merge_pages = merge_pages;
+            window_merge_bytes = merge_bytes;
             window_dl = dl;
             window_dl_bytes = dl_bytes;
             window_dl_finish = dl_finish;

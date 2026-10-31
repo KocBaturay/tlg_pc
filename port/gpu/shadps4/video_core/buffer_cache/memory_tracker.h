@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "tlg_toggles.h"
+#include "common/alignment.h"
 #include "common/debug.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
@@ -70,6 +71,40 @@ public:
                                 manager->template ChangeRegionState<Type::GPU, false>(
                                     manager->GetCpuAddr() + offset, size);
                             });
+    }
+
+    /// tlg: write merge (TLG_WRITE_MERGE=1). A CPU write into GPU-modified pages lets
+    /// `snapshot(page_addr, page_bytes)` keep their current guest contents instead of downloading
+    /// them; the pages turn CPU-modified, and their next upload sends only the bytes that differ
+    /// from the snapshot (BufferCache::SynchronizeMemory). Under the region lock, so the GPU
+    /// thread cannot mark the pages GPU-modified in between. Only GPU-modified pages are
+    /// snapshotted: a page already CPU-modified would lose its pending writes. Returns false when
+    /// a GPU-modified page could not be snapshotted; it is left GPU-modified for the caller's
+    /// download (InvalidateRegion), and the other pages are already CPU-modified.
+    bool MergeCpuWrite(VAddr cpu_addr, u64 size, auto&& snapshot) noexcept {
+        bool merged = true;
+        IteratePages<false>(cpu_addr, size, [&](RegionManager* manager, u64 offset, size_t size) {
+            std::scoped_lock lk{manager->lock};
+            const VAddr base = manager->GetCpuAddr();
+            if (!manager->template IsRegionModified<Type::GPU>(offset, size)) {
+                manager->template ChangeRegionState<Type::CPU, true>(base + offset, size);
+                return;
+            }
+            const u64 first = Common::AlignDown(offset, TRACKER_BYTES_PER_PAGE);
+            for (u64 page = first; page < offset + size; page += TRACKER_BYTES_PER_PAGE) {
+                if (manager->template IsRegionModified<Type::GPU>(page, TRACKER_BYTES_PER_PAGE)) {
+                    if (!snapshot(base + page, TRACKER_BYTES_PER_PAGE)) {
+                        merged = false;
+                        continue;
+                    }
+                    manager->template ChangeRegionState<Type::GPU, false>(base + page,
+                                                                          TRACKER_BYTES_PER_PAGE);
+                }
+                manager->template ChangeRegionState<Type::CPU, true>(base + page,
+                                                                     TRACKER_BYTES_PER_PAGE);
+            }
+        });
+        return merged;
     }
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested

@@ -5,7 +5,11 @@
 
 #include "tlg_copy.h"
 
+#include <array>
 #include <deque>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -13,6 +17,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
 namespace AmdGpu {
@@ -152,6 +157,15 @@ private:
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
+    /// tlg: write merge (TLG_WRITE_MERGE=1, MemoryTracker::MergeCpuWrite). Keeps the guest
+    /// contents of GPU-modified pages a CPU write is about to change; false when the cap is hit.
+    bool SnapshotForMerge(VAddr page_addr, u64 size);
+    /// Splits an upload range into the bytes that differ from the pages' snapshots (pages without
+    /// one upload whole) and refreshes the snapshots to what is uploaded.
+    void AddMergedUploads(VAddr addr, u64 size, auto&& add_copy);
+    /// Drops the snapshots of pages whose guest memory matches the GPU again (downloaded).
+    void DropMergeSnapshots(VAddr addr, u64 size);
+
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     // tlg: texel buffer ranges known not to alias an image, per image registry generation.
@@ -171,6 +185,13 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+
+    /// tlg: write merge snapshots, one per 4 KiB page (merge_mutex after the tracker's region
+    /// locks). A page keeps its snapshot until it is downloaded: its guest copy of the GPU's
+    /// bytes is stale until then, so a whole-page upload would overwrite them.
+    using PageSnapshot = std::array<u8, TRACKER_BYTES_PER_PAGE>;
+    std::mutex merge_mutex;
+    std::unordered_map<VAddr, std::unique_ptr<PageSnapshot>> merge_snapshots;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
